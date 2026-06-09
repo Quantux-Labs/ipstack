@@ -6,6 +6,7 @@ pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
 
 mod seqnum;
+mod signals;
 mod tcb;
 mod tcp;
 mod udp;

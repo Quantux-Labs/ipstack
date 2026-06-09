@@ -1,5 +1,5 @@
 use crate::{
-    IpStackError, PacketReceiver, PacketSender, TTL,
+    IpStackError, PacketReceiver, PacketSender, SessionGuard, TTL,
     packet::{IpHeader, NetworkPacket, TransportHeader},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
@@ -47,18 +47,26 @@ pub struct IpStackUdpStream {
     timeout: Pin<Box<Sleep>>,
     timeout_interval: Duration,
     mtu: u16,
-    destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+    /// RAII guard that removes this flow's slot from the dispatcher's
+    /// [`crate::SessionMap`] on drop. Field declaration order is significant:
+    /// it appears LAST so that on drop, the receiver / sender / timer fields
+    /// drop first (closing the per-flow channel), and only then does the
+    /// guard fire and detach this session from the map. That ordering means a
+    /// late uplink packet racing with drop sees `Occupied` -> failed send,
+    /// which the dispatcher handles via the recreate-on-send-failure path.
+    /// Underscore prefix because the field is read only via Drop.
+    _session_guard: SessionGuard,
 }
 
 impl IpStackUdpStream {
-    pub fn new(
+    pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         payload: Vec<u8>,
         up_pkt_sender: PacketSender,
         mtu: u16,
         timeout_interval: Duration,
-        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+        session_guard: SessionGuard,
     ) -> Self {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
@@ -72,7 +80,7 @@ impl IpStackUdpStream {
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
-            destroy_messenger,
+            _session_guard: session_guard,
         }
     }
 
@@ -206,10 +214,11 @@ impl AsyncWrite for IpStackUdpStream {
     }
 }
 
-impl Drop for IpStackUdpStream {
-    fn drop(&mut self) {
-        if let Some(messenger) = self.destroy_messenger.take() {
-            let _ = messenger.send(());
-        }
-    }
-}
+// No explicit `Drop` impl: Rust drops struct fields in declaration order
+// (top to bottom). The channel ends, timer, and metadata drop first, which
+// closes the per-flow receiver. Then `_session_guard` drops last, removing
+// the slot from the dispatcher's session map. This ordering is what lets the
+// dispatcher's recreate-on-send-failure path catch any uplink packet that
+// raced with drop: it sees `Occupied`, fails to `send`, evicts the stale
+// entry, and treats the packet as a fresh flow.
+

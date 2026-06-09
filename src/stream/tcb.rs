@@ -12,19 +12,45 @@ pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[repr(u8)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
     // SynSent,
-    Listen,
-    SynReceived,
-    Established,
-    FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
-    FinWait2,
-    TimeWait,
-    CloseWait, // act as a server, followed with LastAck, Closed
-    LastAck,
-    Closed,
+    Listen = 0,
+    SynReceived = 1,
+    Established = 2,
+    FinWait1 = 3, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
+    FinWait2 = 4,
+    TimeWait = 5,
+    CloseWait = 6, // act as a server, followed with LastAck, Closed
+    LastAck = 7,
+    Closed = 8,
+}
+
+impl TcpState {
+    /// Inverse of `as u8`. Used by [`super::signals::AtomicTcpState`] to
+    /// round-trip through `AtomicU8`. Panics on bad discriminants only in
+    /// debug builds; the `state` cell is never written from outside this
+    /// crate so a stuck unknown byte would be a bug here, not bad input.
+    #[inline]
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            0 => TcpState::Listen,
+            1 => TcpState::SynReceived,
+            2 => TcpState::Established,
+            3 => TcpState::FinWait1,
+            4 => TcpState::FinWait2,
+            5 => TcpState::TimeWait,
+            6 => TcpState::CloseWait,
+            7 => TcpState::LastAck,
+            8 => TcpState::Closed,
+            other => {
+                debug_assert!(false, "AtomicTcpState observed bogus discriminant {other}");
+                TcpState::Closed
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -43,6 +69,17 @@ pub(super) enum PacketType {
 /// - `unordered_packets` is the bytes stream received from the lower device,
 ///   which can be acknowledged and extracted by `consume_unordered_packets` method
 ///   then can be read by upstream application via `Tcp::poll_read` method.
+/// - `peer_mss` is the Maximum Segment Size advertised by the peer in their
+///   SYN. RFC 9293 §3.7.1 mandates we clamp outgoing segment size to this
+///   value. `None` means the peer omitted the option — RFC default is 536
+///   (IPv4) but in our implementation we fall back to `mtu - hdr` (also
+///   conservative on every modern network).
+///
+/// The TCP state machine **does NOT live here** — it lives lock-free in
+/// [`super::signals::StreamSignals::state`]. That lets `poll_read` /
+/// `poll_write` / `poll_shutdown` peek the state with a single Acquire load
+/// instead of acquiring the `tcb` mutex (which the per-stream task holds
+/// for ~all of its loop body).
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
@@ -50,7 +87,6 @@ pub(crate) struct Tcb {
     mtu: u16,
     last_received_ack: SeqNum,
     send_window: u16,
-    state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
@@ -60,6 +96,7 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    peer_mss: Option<u16>,
 }
 
 impl Tcb {
@@ -82,7 +119,6 @@ impl Tcb {
             mtu,
             last_received_ack: seq.into(),
             send_window: u16::MAX,
-            state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
@@ -92,13 +128,47 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            peer_mss: None,
         }
     }
 
+    /// Calculate the maximum payload length for an outgoing TCP segment.
+    ///
+    /// RFC 9293 §3.7.1: outgoing segments MUST NOT exceed the peer's
+    /// advertised MSS. We clamp to the minimum of three constraints:
+    ///   * the peer's send window (flow control),
+    ///   * the peer's MSS (if advertised in their SYN),
+    ///   * `mtu - (ip_header + tcp_header)` (PMTU bound on our side).
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        let local_max = mtu.saturating_sub(ip_header_size + tcp_header_size);
+        let mut bound = std::cmp::min(send_window, local_max);
+        if let Some(peer_mss) = self.peer_mss {
+            bound = std::cmp::min(bound, peer_mss as usize);
+        }
+        bound
+    }
+
+    /// Set the peer's advertised MSS. Called once during SYN processing in
+    /// [`super::tcp::IpStackTcpStream::new`].
+    pub(super) fn set_peer_mss(&mut self, mss: u16) {
+        // Reject pathological values: RFC 9293 §3.7.1 mandates a minimum
+        // MSS of 1 byte but in practice 88 is the smallest sane value
+        // (IPv4 minimum MTU 68 minus 20 IP header + 20 TCP header doesn't
+        // make geometric sense for 1-byte payloads; we clamp to 88).
+        self.peer_mss = Some(mss.max(88));
+    }
+
+    /// Drop every inflight packet without retransmitting. Called on RST
+    /// receipt — the peer rejected the connection, no point keeping
+    /// zombie retransmit timers alive.
+    pub(super) fn clear_inflight_packets(&mut self) {
+        let n = self.inflight_packets.len();
+        if n > 0 {
+            self.inflight_packets.clear();
+            log::trace!("cleared {n} inflight packet(s) on RST");
+        }
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
@@ -117,8 +187,7 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            log::warn!("Received packet seq {seq} < self ack {}, len = {}", self.ack, buf.len());
             return;
         }
         self.unordered_packets.insert(seq, buf);
@@ -183,12 +252,6 @@ impl Tcb {
     }
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack
-    }
-    pub(super) fn change_state(&mut self, state: TcpState) {
-        self.state = state;
-    }
-    pub(super) fn get_state(&self) -> TcpState {
-        self.state
     }
     pub(super) fn update_send_window(&mut self, window: u16) {
         self.send_window = window;

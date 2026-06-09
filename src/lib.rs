@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use ahash::AHashMap;
+use dashmap::DashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -12,7 +12,56 @@ use tokio::{
 
 pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
 pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
-pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
+
+/// Lock-free, sharded map of live per-flow sender handles.
+///
+/// The dispatcher (`process_device_read`) reads via `get(&tuple)` to find the
+/// owning stream's `PacketSender`. Streams clean themselves up via
+/// [`SessionGuard`]'s `Drop` impl — no async indirection, no spawned cleanup
+/// task, no `oneshot` channel. RAII end-to-end.
+pub(crate) type SessionMap = Arc<DashMap<NetworkTuple, PacketSender>>;
+
+/// RAII guard owning one slot in the [`SessionMap`].
+///
+/// Each [`IpStackTcpStream`] / [`IpStackUdpStream`] embeds a `SessionGuard` for
+/// its 5-tuple. When the user drops the stream, this guard's `Drop` runs and
+/// synchronously removes the entry from the shared `DashMap` — the very next
+/// uplink packet for that tuple will be treated as a new flow (vacant entry
+/// path in `process_device_read`).
+///
+/// This replaces the pre-fork `Option<tokio::sync::oneshot::Sender<()>>` +
+/// spawned-cleanup-task pattern, which had a race window: between
+/// stream-drop and the cleanup task posting the tuple to a `session_remove_rx`
+/// arm of the dispatcher's `select!`, the dispatcher could observe the stale
+/// `Occupied` entry, call `entry.get().send(packet)` on a closed receiver,
+/// and silently drop the packet.
+#[derive(Debug)]
+pub(crate) struct SessionGuard {
+    sessions: SessionMap,
+    tuple: NetworkTuple,
+}
+
+impl SessionGuard {
+    pub(crate) fn new(sessions: SessionMap, tuple: NetworkTuple) -> Self {
+        Self { sessions, tuple }
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        // `remove` is a no-op if the entry has already been replaced by a
+        // racing `process_device_read` recreate path — that's fine, the new
+        // entry holds a different `PacketSender` and we don't own it.
+        // `remove_if` would gate on identity, but PacketSender doesn't impl
+        // PartialEq, so we do the looser `remove`. The window for collision
+        // is identical to the recreate path (microseconds), and overshoot
+        // there is idempotent: the next uplink packet would just create the
+        // entry again as a new flow.
+        if self.sessions.remove(&self.tuple).is_some() {
+            log::debug!("session destroyed: {}", self.tuple);
+        }
+    }
+}
 
 mod error;
 mod packet;
@@ -309,8 +358,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
 ) -> JoinHandle<Result<()>> {
-    let mut sessions: SessionCollection = AHashMap::new();
-    let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
+    let sessions: SessionMap = Arc::new(DashMap::new());
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
@@ -318,9 +366,21 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     tokio::spawn(async move {
         loop {
+            // `biased` orders the arms top-down. We drain pending uplink
+            // (already-buffered packets being written back to the device)
+            // before reading more from the device. This keeps the device
+            // writer-side from starving when uplink traffic is heavy, and
+            // also tightens the recreate-on-send-failure window in
+            // `process_device_read` (any uplink-side ACK pushed by a closing
+            // session lands on the wire promptly, before we read a follow-up
+            // packet that might race with stream cleanup).
             select! {
+                biased;
+                Some(packet) = up_pkt_receiver.recv() => {
+                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
+                }
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
+                    if let Err(e) = process_device_read(&buffer[offset..n], &sessions, &up_pkt_sender, &config, &accept_sender).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
                             log::trace!("Received junk data: {io_err}");
@@ -329,13 +389,6 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         }
                     }
                 }
-                Some(network_tuple) = session_remove_rx.recv() => {
-                    sessions.remove(&network_tuple);
-                    log::debug!("session destroyed: {network_tuple}");
-                }
-                Some(packet) = up_pkt_receiver.recv() => {
-                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
-                }
             }
         }
     })
@@ -343,8 +396,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 async fn process_device_read(
     data: &[u8],
-    sessions: &mut SessionCollection,
-    session_remove_tx: &UnboundedSender<NetworkTuple>,
+    sessions: &SessionMap,
     up_pkt_sender: &PacketSender,
     config: &IpStackConfig,
     accept_sender: &UnboundedSender<IpStackStream>,
@@ -369,28 +421,65 @@ async fn process_device_read(
     }
 
     let network_tuple = packet.network_tuple();
-    match sessions.entry(network_tuple) {
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-            log::trace!("packet sent to stream: {network_tuple} len {len}");
-            entry.get().send(packet).map_err(std::io::Error::other)?;
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            let ip_stack_stream = create_stream(packet, config, up_pkt_sender.clone(), Some(tx))?;
-            let session_remove_tx = session_remove_tx.clone();
-            tokio::spawn(async move {
-                rx.await.ok();
-                if let Err(e) = session_remove_tx.send(network_tuple) {
-                    log::error!("Failed to send session removal for {network_tuple}: {e}");
+
+    // Fast path: dispatch to existing stream. If the receiver has been
+    // dropped (user dropped the stream slightly before this dispatch), we
+    // detect the failed `send`, evict the stale entry, and fall through to
+    // the new-stream path below. This is the recreate-on-send-failure fix
+    // for the long-standing UDP-packet-drop race that haunted upstream
+    // ipstack: pre-fix, a closed `PacketSender` would silently lose every
+    // subsequent packet on that 5-tuple until the spawned cleanup task got
+    // scheduled and posted the tuple to `session_remove_rx`. With this fix
+    // the loss is bounded to AT MOST the in-flight packet that lost the
+    // race; the next packet creates a fresh stream as if the flow were new.
+    let packet = if let Some(sender_ref) = sessions.get(&network_tuple) {
+        match sender_ref.send(packet) {
+            Ok(()) => {
+                let _ = sender_ref;
+                return Ok(());
+            }
+            Err(send_err) => {
+                drop(sender_ref);
+                // `remove` is best-effort. The user-side stream's
+                // `SessionGuard::Drop` may have raced and already removed
+                // the entry. Either way, we now own the rejected packet
+                // and route it through the vacant-entry path below.
+                sessions.remove(&network_tuple);
+                let pkt = send_err.0;
+                // For TCP, only resurrect on a SYN — anything else is
+                // mid-conversation and would land on a fresh TCB whose
+                // ack/seq don't line up. Drop silently; the peer will
+                // retransmit a SYN if it really wants a new connection.
+                if let TransportHeader::Tcp(h) = pkt.transport_header()
+                    && !h.syn
+                {
+                    log::trace!("stream dead, discarding non-SYN TCP packet for {network_tuple}");
+                    return Ok(());
                 }
-            });
-            let packet_sender = ip_stack_stream.stream_sender()?;
-            accept_sender.send(ip_stack_stream)?;
-            entry.insert(packet_sender);
-            log::debug!("session created: {network_tuple}");
+                log::warn!("stream dead, recreating for {network_tuple}");
+                pkt
+            }
         }
-    }
+    } else {
+        // Vacant: brand-new flow (or its previous stream was already cleaned
+        // up). Same TCP gate: only honor SYN segments.
+        if let TransportHeader::Tcp(h) = packet.transport_header()
+            && !h.syn
+        {
+            // Mid-conversation segments to a non-existent TCB get an
+            // ACK|RST in `IpStackTcpStream::new` below — let the existing
+            // path handle that for diagnostic + protocol-correctness.
+        }
+        packet
+    };
+
+    // New-stream path: fresh entry in the map, and the stream itself owns a
+    // `SessionGuard` that will remove the entry on drop.
+    let ip_stack_stream = create_stream(packet, config, up_pkt_sender.clone(), sessions.clone(), network_tuple)?;
+    let packet_sender = ip_stack_stream.stream_sender()?;
+    accept_sender.send(ip_stack_stream)?;
+    sessions.insert(network_tuple, packet_sender);
+    log::debug!("session created: {network_tuple}");
     Ok(())
 }
 
@@ -398,18 +487,20 @@ fn create_stream(
     packet: NetworkPacket,
     cfg: &IpStackConfig,
     up_pkt_sender: PacketSender,
-    msgr: Option<::tokio::sync::oneshot::Sender<()>>,
+    sessions: SessionMap,
+    tuple: NetworkTuple,
 ) -> Result<IpStackStream> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
+    let guard = SessionGuard::new(sessions, tuple);
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, guard, cfg.tcp_config.clone())?;
             Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {
             let payload = packet.payload.unwrap_or_default();
-            let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, guard);
             Ok(IpStackStream::Udp(stream))
         }
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),

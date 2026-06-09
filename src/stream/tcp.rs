@@ -1,6 +1,7 @@
 use super::seqnum::SeqNum;
+use super::signals::StreamSignals;
 use crate::{
-    PacketReceiver, PacketSender, TTL,
+    PacketReceiver, PacketSender, SessionGuard, TTL,
     error::IpStackError,
     packet::{
         IpHeader, NetworkPacket, NetworkTuple, TransportHeader,
@@ -16,7 +17,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -82,43 +83,10 @@ impl Default for TcpConfig {
     }
 }
 
-#[derive(Debug)]
-enum Shutdown {
-    None,
-    Pending(Waker),
-    Ready,
-}
-
-impl Shutdown {
-    fn pending(&mut self, w: Waker) {
-        *self = Shutdown::Pending(w);
-    }
-    fn ready(&mut self) {
-        if let Shutdown::Pending(w) = self {
-            w.wake_by_ref();
-        }
-        *self = Shutdown::Ready;
-    }
-
-    // Just for comparison purpose
-    fn fake_clone(&self) -> Shutdown {
-        match self {
-            Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
-            Shutdown::Ready => Shutdown::Ready,
-        }
-    }
-}
-
-impl std::fmt::Display for Shutdown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Shutdown::None => write!(f, "None"),
-            Shutdown::Pending(_) => write!(f, "Pending"),
-            Shutdown::Ready => write!(f, "Ready"),
-        }
-    }
-}
+// `Shutdown` enum gone: "Ready" collapsed into `signals.state() == Closed`,
+// "Pending" collapsed into a registered waker on `signals.shutdown_waker`,
+// "None" is the absence of both. See `StreamSignals` doc-comment for the
+// rationale.
 
 static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -161,17 +129,25 @@ pub struct IpStackTcpStream {
     stream_receiver: Option<PacketReceiver>,
     up_packet_sender: PacketSender,
     tcb: TcbPtr,
-    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+    /// Lock-free per-stream control state. Replaces the three
+    /// `Arc<Mutex<...>>` fields (`shutdown`, `write_notify`, `read_notify`)
+    /// AND the `state` field that used to live inside `Tcb`. The user-side
+    /// polls and the per-stream task share this via `Arc` clone.
+    signals: Arc<StreamSignals>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
     temp_read_buffer: Vec<u8>,
     config: Arc<TcpConfig>,
+    /// RAII guard owning this flow's slot in the dispatcher's session map.
+    /// Declared LAST so the explicit `Drop` impl below can run
+    /// `block_on(task_handle)` first (joining the per-stream task that may
+    /// still be sending uplink ACKs), and only then does this field drop
+    /// and detach the map slot. See [`crate::SessionGuard`] for the race
+    /// semantics this RAII pattern preserves.
+    _session_guard: SessionGuard,
 }
 
 impl IpStackTcpStream {
@@ -181,10 +157,10 @@ impl IpStackTcpStream {
         tcp: TcpHeader,
         up_packet_sender: PacketSender,
         mtu: u16,
-        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+        session_guard: SessionGuard,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             mtu,
             config.max_unacked_bytes,
@@ -204,9 +180,24 @@ impl IpStackTcpStream {
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
         }
 
+        // Parse the peer's MSS option from the SYN. RFC 9293 §3.7.1 says
+        // we MUST honor it for outgoing segment sizing. If the peer omits
+        // it, RFC says we default to 536 (IPv4) or 1220 (IPv6) — but in
+        // practice every modern stack sends one. We store it on the TCB so
+        // `calculate_payload_max_len` can clamp segment size to
+        // min(send_window, peer_mss, mtu - hdr).
+        for opt in tcp.options_iterator().flatten() {
+            if let TcpOptionElement::MaximumSegmentSize(mss) = opt {
+                tcb.set_peer_mss(mss);
+                log::trace!("{tuple} peer MSS = {mss}");
+                break;
+            }
+        }
+
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let deadline = tokio::time::Instant::now() + config.timeout;
+        let signals = Arc::new(StreamSignals::new(TcpState::Listen));
 
         let mut stream = IpStackTcpStream {
             src_addr,
@@ -215,21 +206,19 @@ impl IpStackTcpStream {
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
             tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
-            shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
-            write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            destroy_messenger,
+            signals,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             data_tx,
             data_rx,
-            read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task_handle: None,
             exit_notifier: None,
             temp_read_buffer: Vec::new(),
             config,
+            _session_guard: session_guard,
         };
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
-        let (seq, ack, state) = { (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state()) };
+        let (seq, ack, state) = (tcb.get_seq().0, tcb.get_ack().0, stream.signals.state());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::debug!("{tuple} {state:?}: {l_info} session begins, total TCP sessions: {sessions}");
 
@@ -293,27 +282,32 @@ impl AsyncRead for IpStackTcpStream {
 
         let network_tuple = self.network_tuple();
 
-        let state = self.tcb.lock().unwrap().get_state();
+        // Lock-free state peek (was: `self.tcb.lock().unwrap().get_state()`).
+        // Avoids contention with the per-stream task that holds the `tcb`
+        // mutex for ~all of its loop iteration body.
+        let state = self.signals.state();
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
-            self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            // Make sure any concurrent poll_shutdown / poll_write also wake.
+            self.signals.shutdown_waker.wake();
+            self.signals.write_waker.wake();
             return Poll::Ready(Ok(()));
         }
 
         // handle timeout
         if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
             {
-                let mut tcb = self.tcb.lock().unwrap();
+                let tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                 log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
-                tcb.change_state(TcpState::Closed);
-                let state = tcb.get_state();
-                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
+                log::warn!("{network_tuple} Closed: [poll_read] {l_info}, session notified to close");
             }
-            self.shutdown.lock().unwrap().ready();
+            // `signals.close()` stores Closed AND wakes all three wakers,
+            // so any concurrent poll_shutdown / poll_write observes it
+            // promptly without waiting for the per-stream 60s timeout.
+            self.signals.close();
 
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
@@ -334,7 +328,14 @@ impl AsyncRead for IpStackTcpStream {
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => {
-                self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                // Register-then-recheck: if state transitioned to Closed
+                // between the early-out above and this point, the wake we'd
+                // miss without the recheck would land us in a 60-second
+                // hang.
+                self.signals.read_waker.register(cx.waker());
+                if self.signals.state() == TcpState::Closed {
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Pending
             }
         }
@@ -346,19 +347,39 @@ impl AsyncWrite for IpStackTcpStream {
         let nt = self.network_tuple();
         self.reset_timeout();
 
+        // Lock-free state check first — avoids needing to acquire the
+        // `tcb` mutex just to discover the connection's already gone.
+        if self.signals.state() == TcpState::Closed {
+            // Wake parked counterparts (read / shutdown) so they observe Closed too.
+            self.signals.read_waker.wake();
+            self.signals.shutdown_waker.wake();
+            return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
+        }
+
         let mut tcb = self.tcb.lock().unwrap();
-        let state = tcb.get_state();
+        let state = self.signals.state();
         let send_window = tcb.get_send_window();
         let is_full = tcb.is_send_buffer_full();
 
+        // Re-check after acquiring the mutex — a concurrent
+        // `tcp_main_logic_loop` iteration may have transitioned to Closed
+        // (e.g. inbound RST) between our pre-lock peek and now.
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
-            self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            drop(tcb);
+            self.signals.read_waker.wake();
+            self.signals.shutdown_waker.wake();
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
         if send_window == 0 || is_full {
-            self.write_notify.lock().unwrap().replace(cx.waker().clone());
+            // Register first, then recheck (standard AtomicWaker idiom).
+            // If a wake() landed between the early-out and the register,
+            // the recheck catches it.
+            drop(tcb);
+            self.signals.write_waker.register(cx.waker());
+            if self.signals.state() == TcpState::Closed {
+                return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
+            }
             let info = format!("current send window: {send_window}, send buffer full: {is_full}");
             log::trace!("{nt} {state:?}: [poll_write] {info}, waiting for the other side to send ACK...");
             return Poll::Pending;
@@ -368,7 +389,7 @@ impl AsyncWrite for IpStackTcpStream {
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
 
-        let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
+        let (seq, ack) = (tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::trace!("{nt} {state:?}: [poll_write] {l_info} upstream data written to device, len = {payload_len}");
 
@@ -380,39 +401,42 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
-        let (nt, state, seq, is_ready) = {
-            let tcb = self.tcb.lock().unwrap();
-            let is_ready = tcb.get_inflight_packets_total_len() == 0;
-            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
-        };
-        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
+        // Fast path: already closed.
+        let state = self.signals.state();
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
-        match shutdown {
-            Shutdown::None => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                self.shutdown.lock().unwrap().pending(cx.waker().clone());
-                Poll::Pending
-            }
-            Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                Poll::Pending
-            }
-            Shutdown::Ready => Poll::Ready(Ok(())),
+
+        // Register the waker first (then recheck) so a concurrent
+        // transition to Closed doesn't get lost.
+        self.signals.shutdown_waker.register(cx.waker());
+        if self.signals.state() == TcpState::Closed {
+            return Poll::Ready(Ok(()));
         }
+
+        let nt = self.network_tuple();
+        let (seq, is_ready) = {
+            let tcb = self.tcb.lock().unwrap();
+            (tcb.get_seq(), tcb.get_inflight_packets_total_len() == 0)
+        };
+        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}");
+
+        if is_ready && state == TcpState::Established {
+            let mut tcb = self.tcb.lock().unwrap();
+            send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb, &self.signals)?;
+        }
+        Poll::Pending
     }
 }
 
-fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
-    let state = tcb.get_state();
+fn send_fin_n_change_state_to_fin_wait1(
+    hint: &str,
+    nt: NetworkTuple,
+    sender: &PacketSender,
+    tcb: &mut Tcb,
+    signals: &StreamSignals,
+) -> std::io::Result<()> {
+    let state = signals.state();
     if !(tcb.get_inflight_packets_total_len() == 0 && state == TcpState::Established) {
         log::debug!("{nt} {state:?}: {hint} session is not in a valid state to send FIN, skipping...");
         return Ok(());
@@ -421,16 +445,16 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
     log::debug!("{nt} {state:?}: {hint} actively send a farewell packet to the other side...");
     write_packet_to_device(sender, nt, tcb, None, ACK | FIN, None, None)?;
     tcb.increase_seq();
-    tcb.change_state(TcpState::FinWait1);
-    let state = tcb.get_state();
-    log::debug!("{nt} {state:?}: {hint} now in {state:?} state");
+    signals.set_state(TcpState::FinWait1);
+    log::debug!("{nt} FinWait1: {hint} now in FinWait1 state");
 
     Ok(())
 }
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
+        let nt = self.network_tuple();
+        let state = self.signals.state();
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
@@ -456,11 +480,8 @@ impl IpStackTcpStream {
         let tcb = self.tcb.clone();
         let stream_receiver = self.stream_receiver.take().unwrap();
         let up_packet_sender = self.up_packet_sender.clone();
-        let shutdown = self.shutdown.clone();
-        let write_notify = self.write_notify.clone();
-        let read_notify = self.read_notify.clone();
+        let signals = self.signals.clone();
         let data_tx = self.data_tx.clone();
-        let destroy_messenger = self.destroy_messenger.take();
 
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
         let exit_notifier = exit_task_notifier.clone();
@@ -475,8 +496,7 @@ impl IpStackTcpStream {
                 up_packet_sender,
                 exit_notifier,
                 network_tuple,
-                write_notify,
-                read_notify,
+                signals.clone(),
                 data_tx,
                 exit_monitor,
             )
@@ -484,10 +504,19 @@ impl IpStackTcpStream {
             if let Err(e) = &v {
                 log::warn!("{network_tuple} task error: {e}");
             }
-            _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
-            log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
-            shutdown.lock().unwrap().ready();
-            log::trace!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
+            // No `destroy_messenger.send(())` here anymore: the session
+            // map entry is owned by the user-side stream's `SessionGuard`,
+            // which fires on the user's drop. The explicit `Drop` impl on
+            // `IpStackTcpStream` joins this task BEFORE the guard runs, so
+            // ordering is: task ends -> stream Drop joins task ->
+            // remaining fields drop -> SessionGuard removes map entry.
+            //
+            // `signals.close()` stores Closed + wakes every parked future
+            // (read / write / shutdown) so the user-side polls observe the
+            // teardown without waiting for the per-stream 60s timeout.
+            // Idempotent if state was already Closed.
+            signals.close();
+            log::trace!("{network_tuple} signals.close() ==========");
             v
         });
         self.task_handle = Some(task_handle);
@@ -503,15 +532,14 @@ async fn tcp_main_logic_loop(
     up_packet_sender: PacketSender,
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    signals: Arc<StreamSignals>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
         let mut tcb = tcb.lock().unwrap();
 
-        let state = tcb.get_state();
+        let state = signals.state();
         if state != TcpState::Listen {
             log::warn!("{network_tuple} {state:?}: Invalid TCP state, not in Listen state");
             return Ok::<(), std::io::Error>(());
@@ -531,26 +559,27 @@ async fn tcp_main_logic_loop(
             None,
         )?;
         tcb.increase_seq();
-        tcb.change_state(TcpState::SynReceived);
-        let state = tcb.get_state();
-        log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
+        signals.set_state(TcpState::SynReceived);
+        log::trace!("{network_tuple} SynReceived: session now in SynReceived state");
     }
 
     let tcb_clone = tcb.clone();
 
-    async fn task_wait_to_close(tcb: TcbPtr, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple, two_msl: Duration) {
+    async fn task_wait_to_close(
+        signals: Arc<StreamSignals>,
+        exit_notifier: tokio::sync::mpsc::Sender<()>,
+        nt: NetworkTuple,
+        two_msl: Duration,
+    ) {
         tokio::time::sleep(two_msl).await;
-        {
-            let mut tcb = tcb.lock().unwrap();
-            tcb.change_state(TcpState::Closed);
-            let state = tcb.get_state();
-            log::debug!("{nt} {state:?}: [task_wait_to_close] session closed after {two_msl:?}");
-        }
+        signals.close();
+        log::debug!("{nt} Closed: [task_wait_to_close] session closed after {two_msl:?}");
         exit_notifier.send(()).await.unwrap_or(());
     }
 
     async fn task_last_ack(
         tcb: TcbPtr,
+        signals: Arc<StreamSignals>,
         exit_notifier: tokio::sync::mpsc::Sender<()>,
         nt: NetworkTuple,
         pkt_sdr: PacketSender,
@@ -559,7 +588,7 @@ async fn tcp_main_logic_loop(
     ) {
         let hint = "[task_last_ack]";
         for idx in 1..=last_ack_max_retries {
-            let state = { tcb.lock().unwrap().get_state() };
+            let state = signals.state();
             if state == TcpState::Closed {
                 log::debug!("{nt} {state:?}: {hint} session closed, exiting 1...");
                 return;
@@ -567,28 +596,25 @@ async fn tcp_main_logic_loop(
 
             tokio::time::sleep(last_ack_timeout).await;
 
+            let state = signals.state();
+            if state == TcpState::Closed {
+                log::debug!("{nt} {state:?}: {hint} session closed, exiting 2...");
+                return;
+            }
             {
                 let tcb = tcb.lock().unwrap();
-                let state = tcb.get_state();
-                if state == TcpState::Closed {
-                    log::debug!("{nt} {state:?}: {hint} session closed, exiting 2...");
-                    return;
-                }
                 log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{last_ack_max_retries})");
                 _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, None, None);
             }
         }
-        {
-            let mut tcb = tcb.lock().unwrap();
-            tcb.change_state(TcpState::Closed);
-            let state = tcb.get_state();
-            log::warn!("{nt} {state:?}: {hint} max retries reached, forcibly closing session");
-        }
+        signals.close();
+        log::warn!("{nt} Closed: {hint} max retries reached, forcibly closing session");
         exit_notifier.send(()).await.unwrap_or(());
     }
 
     async fn task_timed_out_for_close_wait(
         tcb: TcbPtr,
+        signals: Arc<StreamSignals>,
         exit_notifier: tokio::sync::mpsc::Sender<()>,
         nt: NetworkTuple,
         up_packet_sender: PacketSender,
@@ -597,22 +623,23 @@ async fn tcp_main_logic_loop(
         last_ack_max_retries: usize,
     ) -> std::io::Result<()> {
         tokio::time::sleep(close_wait_timeout).await; // Wait CLOSE_WAIT_TIMEOUT for upstream
-        let tcb_clone = tcb.clone();
-        let mut tcb = tcb.lock().unwrap();
-        let state = tcb.get_state();
+        let state = signals.state();
         if state != TcpState::CloseWait {
             return Ok(());
         }
-        log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
-        write_packet_to_device(&up_packet_sender, nt, &tcb, None, ACK | FIN, None, None)?;
-        tcb.increase_seq();
-        tcb.change_state(TcpState::LastAck);
-        let new_state = tcb.get_state();
-        log::debug!("{nt} {state:?}: Forced transition to {new_state:?}");
+        {
+            let mut tcb_guard = tcb.lock().unwrap();
+            log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
+            write_packet_to_device(&up_packet_sender, nt, &tcb_guard, None, ACK | FIN, None, None)?;
+            tcb_guard.increase_seq();
+        }
+        signals.set_state(TcpState::LastAck);
+        log::debug!("{nt} {state:?}: Forced transition to LastAck");
 
         // Here we set a timer to wait for the last ACK from the other side.
         tokio::spawn(task_last_ack(
-            tcb_clone,
+            tcb,
+            signals,
             exit_notifier,
             nt,
             up_packet_sender,
@@ -635,11 +662,9 @@ async fn tcp_main_logic_loop(
         };
 
         let Some(mut network_packet) = network_packet else {
-            let state = { tcb.lock().unwrap().get_state() };
+            let state = signals.state();
             log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
-            tcb.lock().unwrap().change_state(TcpState::Closed);
-            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            signals.close();
             break;
         };
 
@@ -655,14 +680,25 @@ async fn tcp_main_logic_loop(
 
         let mut tcb = tcb.lock().unwrap();
 
-        let state = tcb.get_state();
+        let state = signals.state();
         if state == TcpState::Closed {
             log::debug!("{network_tuple} {state:?}: session finished, exiting task...");
             break;
         }
 
         if flags & RST == RST {
-            tcb.change_state(TcpState::Closed);
+            // RFC 9293 §3.10.7.4: a valid RST in an established connection
+            // immediately tears down the TCB. We:
+            //   1) transition to Closed AND wake all parked user-side
+            //      futures so they observe Closed promptly (without this
+            //      they'd hang until the per-stream 60s TIMEOUT),
+            //   2) clear inflight packets so the next timer tick doesn't
+            //      generate zombie retransmits for data that will never be
+            //      acknowledged.
+            tcb.clear_inflight_packets();
+            drop(tcb);
+            signals.close();
+            log::debug!("{network_tuple} received RST, session torn down");
             continue;
         }
 
@@ -686,7 +722,7 @@ async fn tcp_main_logic_loop(
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
-        let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
+        let (seq, ack) = (tcb.get_seq(), tcb.get_ack());
         let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
@@ -698,15 +734,15 @@ async fn tcp_main_logic_loop(
             TcpState::SynReceived if flags & ACK == ACK => {
                 if len > 0 {
                     tcb.add_unordered_packet(incoming_seq, payload);
-                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &signals)?;
                 }
-                tcb.change_state(TcpState::Established);
+                signals.set_state(TcpState::Established);
             }
             TcpState::Established => {
                 if flags == ACK {
                     match pkt_type {
                         PacketType::WindowUpdate => {
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            signals.write_waker.wake();
                         }
                         PacketType::KeepAlive => {
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -724,11 +760,11 @@ async fn tcp_main_logic_loop(
                         PacketType::NewPacket => {
                             tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &signals)?;
+                            signals.write_waker.wake();
                         }
                         PacketType::Ack => {
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            signals.write_waker.wake();
                         }
                         PacketType::Invalid => {}
                     }
@@ -736,21 +772,19 @@ async fn tcp_main_logic_loop(
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::CloseWait);
+                    signals.set_state(TcpState::CloseWait);
 
-                    let s = tcb.get_state();
                     let len = tcb.get_inflight_packets_total_len();
                     if len == 0 {
                         // All upstream data sent, proceed to LastAck
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
+                        log::trace!("{network_tuple} CloseWait: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
 
                         // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
                         tcb.increase_seq();
-                        tcb.change_state(TcpState::LastAck);
+                        signals.set_state(TcpState::LastAck);
 
-                        let s = tcb.get_state();
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
+                        log::trace!("{network_tuple} LastAck: {l_info}, {pkt_type:?}, wait the last ack from the other side");
 
                         // Here we set a timer to wait for the last ACK from the other side.
                         // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
@@ -758,6 +792,7 @@ async fn tcp_main_logic_loop(
                         let up = up_packet_sender.clone();
                         tokio::spawn(task_last_ack(
                             tcb_clone.clone(),
+                            signals.clone(),
                             exit_notifier,
                             network_tuple,
                             up,
@@ -765,8 +800,8 @@ async fn tcp_main_logic_loop(
                             config.last_ack_max_retries,
                         ));
                     } else {
-                        // Upstream data pending, wake write_notify and wait
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        // Upstream data pending, wake the parked writer and wait
+                        signals.write_waker.wake();
                         log::debug!("{network_tuple} {state:?}: Waiting for upstream data to complete, inflight packets: {len}",);
 
                         // Spawn a timeout task to force FIN if upstream is unresponsive
@@ -774,6 +809,7 @@ async fn tcp_main_logic_loop(
                         let up = up_packet_sender.clone();
                         tokio::spawn(task_timed_out_for_close_wait(
                             tcb,
+                            signals.clone(),
                             exit_notifier,
                             network_tuple,
                             up,
@@ -785,7 +821,7 @@ async fn tcp_main_logic_loop(
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &signals)?;
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -796,9 +832,8 @@ async fn tcp_main_logic_loop(
                 if flags & ACK == ACK && tcb.get_inflight_packets_total_len() == 0 {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
                     tcb.increase_seq();
-                    tcb.change_state(TcpState::LastAck);
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received ACK|FIN, transitioned to {new_state:?}");
+                    signals.set_state(TcpState::LastAck);
+                    log::trace!("{network_tuple} {state:?}: Received ACK|FIN, transitioned to LastAck");
 
                     // Here we set a timer to wait for the last ACK from the other side.
                     // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
@@ -806,6 +841,7 @@ async fn tcp_main_logic_loop(
                     let up = up_packet_sender.clone();
                     tokio::spawn(task_last_ack(
                         tcb_clone.clone(),
+                        signals.clone(),
                         exit_notifier,
                         network_tuple,
                         up,
@@ -813,39 +849,36 @@ async fn tcp_main_logic_loop(
                         config.last_ack_max_retries,
                     ));
                 } else {
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    signals.write_waker.wake();
                 }
             }
             TcpState::LastAck if flags & ACK == ACK => {
-                tcb.change_state(TcpState::Closed);
+                signals.set_state(TcpState::Closed);
                 tokio::spawn(async move {
                     if let Err(e) = exit_notifier.send(()).await {
                         log::debug!("exit_notifier send failed: {e}");
                     }
                 });
-                let new_state = tcb.get_state();
-                log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
+                log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to Closed");
             }
             TcpState::FinWait1 => {
                 if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                     // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::TimeWait);
+                    signals.set_state(TcpState::TimeWait);
 
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
+                    tokio::spawn(task_wait_to_close(signals.clone(), exit_notifier, network_tuple, config.two_msl));
+                    log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to TimeWait directly");
                 } else if flags & ACK == ACK {
-                    tcb.change_state(TcpState::FinWait2);
+                    signals.set_state(TcpState::FinWait2);
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &signals)?;
+                        signals.write_waker.wake();
                     }
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {new_state:?}");
+                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to FinWait2");
                 } else {
                     // unnormal case, we do nothing here
                     log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
@@ -855,10 +888,9 @@ async fn tcp_main_logic_loop(
                 if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::TimeWait);
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
+                    signals.set_state(TcpState::TimeWait);
+                    tokio::spawn(task_wait_to_close(signals.clone(), exit_notifier, network_tuple, config.two_msl));
+                    log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to TimeWait");
                 } else if flags & ACK == ACK && len == 0 {
                     // unnormal case, we do nothing here
                     let l_ack = tcb.get_ack();
@@ -871,14 +903,13 @@ async fn tcp_main_logic_loop(
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &signals)?;
+                        signals.write_waker.wake();
                     }
                     if flags & FIN == FIN {
-                        tcb.change_state(TcpState::TimeWait);
-                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                        let new_state = tcb.get_state();
-                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
+                        signals.set_state(TcpState::TimeWait);
+                        tokio::spawn(task_wait_to_close(signals.clone(), exit_notifier, network_tuple, config.two_msl));
+                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to TimeWait");
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -887,7 +918,7 @@ async fn tcp_main_logic_loop(
             }
             TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {
                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
+                // wait to timeout, can't transition to Closed yet here
                 // now we need to wait for the timeout to reach...
             }
             _ => {}
@@ -904,9 +935,10 @@ fn extract_data_n_write_upstream(
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    signals: &StreamSignals,
 ) -> std::io::Result<()> {
-    let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
+    let state = signals.state();
+    let (seq, ack) = (tcb.get_seq(), tcb.get_ack());
     let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
     if state == TcpState::Closed {
         log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
@@ -917,7 +949,7 @@ fn extract_data_n_write_upstream(
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
-        read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        signals.read_waker.wake();
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
     Ok(())
